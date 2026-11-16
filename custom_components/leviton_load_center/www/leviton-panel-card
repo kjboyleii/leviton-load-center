@@ -1,0 +1,214 @@
+/**
+ * Leviton breaker panel card.
+ *
+ * Layout model (matches sensor_descriptions._is_on_leg):
+ *   - Positions are numbered by row: row r holds positions 2r-1 (left) and 2r (right).
+ *   - A 2-pole breaker at position p spans positions p and p+2 (two rows, same column).
+ *
+ * Card config:
+ *   type: custom:leviton-panel-card
+ *   hub: <hub id>     # optional; defaults to the first hub found
+ *   title: <string>   # optional; defaults to the hub name
+ */
+class LevitonPanelCard extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: "open" });
+    this._layouts = null;
+    this._error = null;
+    this._requested = false;
+  }
+
+  setConfig(config) {
+    this._config = config || {};
+    this._render();
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    if (!this._requested) {
+      this._requested = true;
+      this._load();
+    }
+  }
+
+  getCardSize() {
+    const layout = this._pickLayout();
+    return layout ? Math.ceil(layout.size / 2) + 2 : 6;
+  }
+
+  static getStubConfig() {
+    return {};
+  }
+
+  async _load() {
+    try {
+      this._layouts = await this._hass.callWS({
+        type: "leviton_load_center/panel_layout",
+      });
+      this._error = null;
+    } catch (err) {
+      this._error = err && err.message ? err.message : String(err);
+    }
+    this._render();
+  }
+
+  _pickLayout() {
+    if (!this._layouts || !this._layouts.length) return null;
+    const hub = this._config && this._config.hub;
+    return (
+      (hub && this._layouts.find((l) => l.hub_id === hub)) || this._layouts[0]
+    );
+  }
+
+  _render() {
+    const root = this.shadowRoot;
+    const layout = this._pickLayout();
+    let body;
+
+    if (this._error) {
+      body = `<div class="note">Could not load panel layout: ${esc(this._error)}</div>`;
+    } else if (!this._layouts) {
+      body = `<div class="note">Loading panel…</div>`;
+    } else if (!layout) {
+      body = `<div class="note">No Leviton hubs found. Check that the integration is set up.</div>`;
+    } else {
+      body = this._panelHtml(layout);
+    }
+
+    const title = (this._config && this._config.title) || (layout && layout.name) || "Breaker panel";
+
+    root.innerHTML = `
+      <style>${STYLE}</style>
+      <ha-card>
+        <div class="header">${esc(title)}</div>
+        ${body}
+      </ha-card>`;
+  }
+
+  _panelHtml(layout) {
+    const rows = layout.size / 2;
+    const occupied = new Set();
+    const tiles = [];
+
+    for (const b of layout.breakers) {
+      const col = b.position % 2 === 1 ? 1 : 3;
+      const row = Math.ceil(b.position / 2);
+      const span = Math.max(1, b.poles);
+      for (let i = 0; i < span; i++) occupied.add(b.position + 2 * i);
+      tiles.push(this._breakerHtml(b, row, col, span));
+    }
+
+    // Row-number spine and empty slots
+    const spine = [];
+    const empties = [];
+    for (let r = 1; r <= rows; r++) {
+      const left = 2 * r - 1;
+      const right = 2 * r;
+      spine.push(
+        `<div class="spine" style="grid-row:${r};grid-column:2">
+           <span>${left}</span><span>${right}</span>
+         </div>`
+      );
+      if (!occupied.has(left))
+        empties.push(`<div class="slot empty" style="grid-row:${r};grid-column:1"></div>`);
+      if (!occupied.has(right))
+        empties.push(`<div class="slot empty" style="grid-row:${r};grid-column:3"></div>`);
+    }
+
+    return `
+      <div class="enclosure">
+        <div class="bus" aria-hidden="true"></div>
+        <div class="grid" style="grid-template-rows:repeat(${rows}, var(--row-h))">
+          ${empties.join("")}${tiles.join("")}${spine.join("")}
+        </div>
+      </div>`;
+  }
+
+  _breakerHtml(b, row, col, span) {
+    const side = col === 1 ? "left" : "right";
+    const label = b.name ? esc(b.name) : `<span class="unnamed">Position ${b.position}</span>`;
+    const rating = b.rating ? `${b.rating}A` : "";
+    const cls = ["slot", "breaker", side, b.smart ? "smart" : "basic", span > 1 ? "double" : ""]
+      .filter(Boolean)
+      .join(" ");
+    return `
+      <div class="${cls}" style="grid-row:${row} / span ${span};grid-column:${col}"
+           title="Position ${b.position}${span > 1 ? "–" + (b.position + 2 * (span - 1)) : ""}">
+        <div class="handle"><i></i></div>
+        <div class="text">
+          <div class="name">${label}</div>
+          <div class="rating">${rating}</div>
+        </div>
+      </div>`;
+  }
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+const STYLE = `
+  :host {
+    --row-h: 44px;
+    --gap: 4px;
+    --metal: var(--secondary-background-color, #e4e6e8);
+    --metal-edge: var(--divider-color, #b8bcc0);
+    --breaker: var(--card-background-color, #fff);
+    --ink: var(--primary-text-color, #1c1c1c);
+    --ink-dim: var(--secondary-text-color, #6b6f73);
+    --accent: var(--primary-color, #03a9f4);
+  }
+  .header { padding: 16px 16px 4px; font-size: 1.1rem; font-weight: 500; color: var(--ink); }
+  .note { padding: 16px; color: var(--ink-dim); }
+  .enclosure {
+    position: relative;
+    margin: 12px 16px 16px;
+    padding: 12px 14px;
+    background: var(--metal);
+    border: 2px solid var(--metal-edge);
+    border-radius: 6px;
+    box-shadow: inset 0 2px 6px rgba(0,0,0,.18);
+  }
+  .bus { position: absolute; top: 8px; bottom: 8px; left: 50%; width: 22px;
+         transform: translateX(-50%); border-radius: 3px;
+         background: repeating-linear-gradient(to bottom, transparent 0 calc(var(--row-h) - 2px), var(--metal-edge) calc(var(--row-h) - 2px) calc(var(--row-h) + var(--gap) - 2px));
+         opacity: .0; }
+  .grid { display: grid; grid-template-columns: 1fr 28px 1fr; gap: var(--gap) 0; column-gap: 0; row-gap: var(--gap); }
+  .spine { display: flex; flex-direction: column; justify-content: center; align-items: center;
+           font-size: .62rem; line-height: 1.1; color: var(--ink-dim); font-variant-numeric: tabular-nums; }
+  .slot { min-width: 0; border-radius: 3px; }
+  .slot.empty { border: 1px dashed var(--metal-edge); opacity: .6; }
+  .breaker {
+    display: flex; align-items: center; gap: 8px; padding: 0 8px;
+    background: var(--breaker); border: 1px solid var(--metal-edge);
+    box-shadow: 0 1px 0 rgba(0,0,0,.12);
+    overflow: hidden;
+  }
+  .breaker.left { flex-direction: row; margin-right: 4px; }
+  .breaker.right { flex-direction: row-reverse; text-align: right; margin-left: 4px; }
+  .breaker.basic { opacity: .75; }
+  .handle {
+    flex: none; width: 14px; align-self: stretch; margin: 6px 0;
+    border-radius: 2px; background: var(--metal); border: 1px solid var(--metal-edge);
+    display: flex; align-items: flex-start; justify-content: center; padding-top: 3px;
+  }
+  .breaker.double .handle { margin: 10px 0; }
+  .handle i { display: block; width: 8px; height: 40%; border-radius: 1px; background: var(--accent); }
+  .breaker.basic .handle i { background: var(--ink-dim); }
+  .text { min-width: 0; flex: 1; }
+  .name { color: var(--ink); font-size: .85rem; font-weight: 500;
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .unnamed { color: var(--ink-dim); font-weight: 400; }
+  .rating { color: var(--ink-dim); font-size: .7rem; font-variant-numeric: tabular-nums; }
+`;
+
+customElements.define("leviton-panel-card", LevitonPanelCard);
+window.customCards = window.customCards || [];
+window.customCards.push({
+  type: "leviton-panel-card",
+  name: "Leviton breaker panel",
+  description: "Physical-style layout of a Leviton panel with breaker positions and labels.",
+});
