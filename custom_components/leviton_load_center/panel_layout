@@ -1,0 +1,97 @@
+"""Breaker panel layout data for the Leviton integration.
+
+Builds a per-hub description of the physical panel (size, breaker positions,
+labels) from coordinator data and exposes it to the frontend card.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import voluptuous as vol
+
+from homeassistant.components import websocket_api
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.core import HomeAssistant, callback
+
+from .const import DOMAIN
+from .coordinator import LevitonData
+
+
+def _panel_size(declared: int | None, breakers: list[Any]) -> int:
+    """Return the number of breaker spaces, always even.
+
+    Uses the size the hub reports, but never less than what the discovered
+    breakers need (a 2-pole breaker at position p also occupies p + 2).
+    """
+    needed = max((b.position + 2 * (b.poles - 1) for b in breakers), default=0)
+    size = max(declared or 0, needed)
+    return size + (size % 2)
+
+
+def _breaker_entry(breaker: Any) -> dict[str, Any]:
+    """Serialize one breaker for the frontend."""
+    return {
+        "id": breaker.id,
+        "position": breaker.position,
+        "poles": breaker.poles,
+        "name": breaker.name or "",
+        "rating": breaker.current_rating,
+        "smart": breaker.is_smart,
+    }
+
+
+def build_layouts(data: LevitonData) -> list[dict[str, Any]]:
+    """Return one layout per hub (LWHEM or LDATA panel)."""
+    layouts: list[dict[str, Any]] = []
+
+    for whem_id, whem in data.whems.items():
+        breakers = [
+            b
+            for b in data.breakers.values()
+            if b.iot_whem_id == whem_id and not b.is_lsbma
+        ]
+        layouts.append(
+            {
+                "hub_id": whem_id,
+                "hub_type": "whem",
+                "name": whem.name or f"LWHEM {whem_id}",
+                "size": _panel_size(whem.panel_size, breakers),
+                "breakers": [_breaker_entry(b) for b in breakers],
+            }
+        )
+
+    for panel_id, panel in data.panels.items():
+        breakers = [
+            b
+            for b in data.breakers.values()
+            if b.residential_breaker_panel_id == panel_id and not b.is_lsbma
+        ]
+        layouts.append(
+            {
+                "hub_id": panel_id,
+                "hub_type": "ldata",
+                "name": panel.name or f"Panel {panel_id}",
+                "size": _panel_size(panel.panel_size, breakers),
+                "breakers": [_breaker_entry(b) for b in breakers],
+            }
+        )
+
+    return layouts
+
+
+@websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/panel_layout"})
+@callback
+def ws_panel_layout(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return panel layouts for all loaded Leviton config entries."""
+    layouts: list[dict[str, Any]] = []
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        runtime = getattr(entry, "runtime_data", None)
+        if entry.state is not ConfigEntryState.LOADED or runtime is None:
+            continue
+        layouts.extend(build_layouts(runtime.coordinator.data))
+    connection.send_result(msg["id"], layouts)
