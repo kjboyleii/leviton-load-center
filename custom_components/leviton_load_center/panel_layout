@@ -1,11 +1,13 @@
 """Breaker panel layout data for the Leviton integration.
 
 Builds a per-hub description of the physical panel (size, breaker positions,
-labels) from coordinator data and exposes it to the frontend card.
+labels, and what each breaker's face should show) from coordinator data and
+streams it to the frontend card.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import voluptuous as vol
@@ -14,8 +16,133 @@ from homeassistant.components import websocket_api
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant, callback
 
-from .const import DOMAIN
+from .const import (
+    BREAKER_OFF_STATES,
+    BREAKER_OFFLINE_STATES,
+    DOMAIN,
+    STATE_AFCI_MISWIRE,
+    STATE_AFCI_PARALLEL_FAULT,
+    STATE_AFCI_SERIAL_ARC_5A,
+    STATE_AFCI_SERIAL_ARC_10A,
+    STATE_AFCI_SERIAL_ARC_15A,
+    STATE_AFCI_SERIAL_ARC_20A,
+    STATE_AFCI_SERIAL_ARC_30A,
+    STATE_GFCI_FAULT,
+    STATE_MANUAL_OFF,
+    STATE_REMOTE_OFF,
+)
 from .coordinator import LevitonData
+
+_AFCI_FAULT_STATES = frozenset(
+    {
+        STATE_AFCI_MISWIRE,
+        STATE_AFCI_PARALLEL_FAULT,
+        STATE_AFCI_SERIAL_ARC_5A,
+        STATE_AFCI_SERIAL_ARC_10A,
+        STATE_AFCI_SERIAL_ARC_15A,
+        STATE_AFCI_SERIAL_ARC_20A,
+        STATE_AFCI_SERIAL_ARC_30A,
+    }
+)
+
+# Everything in BREAKER_OFF_STATES except a manual switch-off is a trip/fault.
+_TRIP_STATES = BREAKER_OFF_STATES - {STATE_MANUAL_OFF}
+
+# Catalog numbers look like LB115-DST: LB, pole count digit, amps, "-", type.
+# Type letters: S standard, G GFCI (5 mA), E GFPE (30 mA), A AFCI, D dual
+# function. Gen 2 adds a trailing T (ST, GST, EST, AST, DST).
+_MODEL_RE = re.compile(r"^LB\d{3}-([A-Z]+)$")
+
+
+# Available breaker sizes (amps) by (poles, protection). "none" is a regular
+# breaker. There is no dual-function 2-pole breaker. The larger 2-pole regular
+# sizes below are only made as basic (non-smart) breakers.
+_RATINGS: dict[tuple[int, str], frozenset[int]] = {
+    (1, "none"): frozenset({15, 20, 25, 30}),
+    (1, "afci"): frozenset({15, 20}),
+    (1, "gfci"): frozenset({15, 20, 25, 30}),
+    (1, "dual"): frozenset({15, 20}),
+    (2, "none"): frozenset({15, 20, 25, 30, 35, 40, 45, 50, 60}),
+    (2, "afci"): frozenset({15, 20}),
+    (2, "gfci"): frozenset({15, 20, 25, 30, 40, 50, 60}),
+}
+_BASIC_ONLY_2POLE_RATINGS = frozenset({70, 80, 90, 100, 110, 125})
+
+
+def _rating_fits(breaker: Any, protection: str) -> bool:
+    """Return True if the breaker's size exists for this pole count and type."""
+    rating = breaker.current_rating
+    if rating is None:
+        return True
+    allowed = _RATINGS.get((breaker.poles, protection), frozenset())
+    if breaker.poles == 2 and protection == "none" and not breaker.is_smart:
+        allowed = allowed | _BASIC_ONLY_2POLE_RATINGS
+    return rating in allowed
+
+
+def _protection(breaker: Any) -> str:
+    """Return none / gfci / afci / dual for a breaker.
+
+    Primary source is the catalog number. If the model is unrecognized, fall
+    back to which protection firmware the breaker reports, checked against the
+    sizes that exist for that type.
+    """
+    match = _MODEL_RE.match((breaker.model or "").upper())
+    if match:
+        code = match.group(1).removesuffix("T")
+        if code == "D":
+            return "dual"
+        if code in ("G", "E"):
+            return "gfci"
+        if code == "A":
+            return "afci"
+        if code == "S":
+            return "none"
+    gfci = bool(breaker.firmware_version_gfci)
+    afci = bool(breaker.firmware_version_afci)
+    guess = "dual" if gfci and afci else "gfci" if gfci else "afci" if afci else "none"
+    # Model unrecognized: only trust the firmware guess if that type is actually
+    # sold in this size and pole count.
+    return guess if _rating_fits(breaker, guess) else "none"
+
+
+def _indicators(breaker: Any, protection: str) -> list[str]:
+    """Indicator lights this breaker has, in face order (top to bottom)."""
+    if not breaker.is_smart:
+        return []
+    lights: list[str] = []
+    if protection in ("afci", "dual"):
+        lights.append("af")
+    if protection in ("gfci", "dual"):
+        lights.append("gf")
+    if breaker.is_gen2:
+        lights.append("off")  # Gen 1 is remotely tripped, not turned off
+    return lights
+
+
+def _lit(breaker: Any, indicators: list[str]) -> list[str]:
+    """Indicator lights that are currently lit."""
+    lit: list[str] = []
+    state = breaker.current_state
+    if "gf" in indicators and state == STATE_GFCI_FAULT:
+        lit.append("gf")
+    if "af" in indicators and state in _AFCI_FAULT_STATES:
+        lit.append("af")
+    if "off" in indicators and breaker.remote_state == STATE_REMOTE_OFF:
+        lit.append("off")
+    return lit
+
+
+def _window(breaker: Any) -> str:
+    """Status window: on (green), tripped (red), off (white) or none (grey, basic)."""
+    if not breaker.is_smart:
+        return "none"
+    state = breaker.current_state
+    if state in _TRIP_STATES:
+        return "tripped"
+    if state == STATE_MANUAL_OFF or state in BREAKER_OFFLINE_STATES:
+        return "off"
+    return "on"
 
 
 def _panel_size(declared: int | None, breakers: list[Any]) -> int:
@@ -31,6 +158,8 @@ def _panel_size(declared: int | None, breakers: list[Any]) -> int:
 
 def _breaker_entry(breaker: Any) -> dict[str, Any]:
     """Serialize one breaker for the frontend."""
+    protection = _protection(breaker)
+    indicators = _indicators(breaker, protection)
     return {
         "id": breaker.id,
         "position": breaker.position,
@@ -38,6 +167,11 @@ def _breaker_entry(breaker: Any) -> dict[str, Any]:
         "name": breaker.name or "",
         "rating": breaker.current_rating,
         "smart": breaker.is_smart,
+        "gen": 2 if breaker.is_gen2 else 1 if breaker.is_smart else None,
+        "protection": protection,
+        "indicators": indicators,
+        "lit": _lit(breaker, indicators),
+        "window": _window(breaker),
     }
 
 
@@ -80,18 +214,50 @@ def build_layouts(data: LevitonData) -> list[dict[str, Any]]:
     return layouts
 
 
-@websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/panel_layout"})
+def _loaded_runtimes(hass: HomeAssistant) -> list[Any]:
+    """Return runtime data for every loaded Leviton config entry."""
+    runtimes = []
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        runtime = getattr(entry, "runtime_data", None)
+        if entry.state is ConfigEntryState.LOADED and runtime is not None:
+            runtimes.append(runtime)
+    return runtimes
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): f"{DOMAIN}/subscribe_panel_layout"}
+)
 @callback
-def ws_panel_layout(
+def ws_subscribe_panel_layout(
     hass: HomeAssistant,
     connection: websocket_api.ActiveConnection,
     msg: dict[str, Any],
 ) -> None:
-    """Return panel layouts for all loaded Leviton config entries."""
-    layouts: list[dict[str, Any]] = []
-    for entry in hass.config_entries.async_entries(DOMAIN):
-        runtime = getattr(entry, "runtime_data", None)
-        if entry.state is not ConfigEntryState.LOADED or runtime is None:
-            continue
-        layouts.extend(build_layouts(runtime.coordinator.data))
-    connection.send_result(msg["id"], layouts)
+    """Send panel layouts now and again whenever what the card shows changes."""
+    runtimes = _loaded_runtimes(hass)
+    last: list[dict[str, Any]] | None = None
+
+    @callback
+    def _push() -> None:
+        nonlocal last
+        layouts: list[dict[str, Any]] = []
+        for runtime in runtimes:
+            layouts.extend(build_layouts(runtime.coordinator.data))
+        # Coordinator updates arrive every few seconds with power data the
+        # card doesn't show; only forward real changes.
+        if layouts == last:
+            return
+        last = layouts
+        connection.send_message(websocket_api.event_message(msg["id"], layouts))
+
+    unsubs = [r.coordinator.async_add_listener(_push) for r in runtimes]
+
+    @callback
+    def _unsubscribe() -> None:
+        for unsub in unsubs:
+            unsub()
+
+    connection.subscriptions[msg["id"]] = _unsubscribe
+    connection.send_result(msg["id"])
+    _push()
+
