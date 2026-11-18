@@ -16,7 +16,8 @@ class LevitonPanelCard extends HTMLElement {
     this.attachShadow({ mode: "open" });
     this._layouts = null;
     this._error = null;
-    this._requested = false;
+    this._unsub = null;
+    this._subscribing = false;
   }
 
   setConfig(config) {
@@ -26,43 +27,56 @@ class LevitonPanelCard extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
-    if (!this._requested) {
-      this._requested = true;
-      this._load();
+    this._subscribe();
+  }
+
+  connectedCallback() {
+    this._subscribe();
+  }
+
+  disconnectedCallback() {
+    if (this._unsub) {
+      this._unsub();
+      this._unsub = null;
     }
   }
 
   getCardSize() {
     const layout = this._pickLayout();
-    return layout ? Math.ceil(layout.size / 2) + 2 : 6;
+    return layout ? Math.ceil(layout.size / 2) * 1.2 + 2 : 8;
   }
 
   static getStubConfig() {
     return {};
   }
 
-  async _load() {
+  async _subscribe() {
+    if (this._unsub || this._subscribing || !this._hass || !this.isConnected) return;
+    this._subscribing = true;
     try {
-      this._layouts = await this._hass.callWS({
-        type: "leviton_load_center/panel_layout",
-      });
-      this._error = null;
+      this._unsub = await this._hass.connection.subscribeMessage(
+        (layouts) => {
+          this._layouts = layouts;
+          this._error = null;
+          this._render();
+        },
+        { type: "leviton_load_center/subscribe_panel_layout" }
+      );
     } catch (err) {
       this._error = err && err.message ? err.message : String(err);
+      this._render();
+    } finally {
+      this._subscribing = false;
     }
-    this._render();
   }
 
   _pickLayout() {
     if (!this._layouts || !this._layouts.length) return null;
     const hub = this._config && this._config.hub;
-    return (
-      (hub && this._layouts.find((l) => l.hub_id === hub)) || this._layouts[0]
-    );
+    return (hub && this._layouts.find((l) => l.hub_id === hub)) || this._layouts[0];
   }
 
   _render() {
-    const root = this.shadowRoot;
     const layout = this._pickLayout();
     let body;
 
@@ -76,9 +90,10 @@ class LevitonPanelCard extends HTMLElement {
       body = this._panelHtml(layout);
     }
 
-    const title = (this._config && this._config.title) || (layout && layout.name) || "Breaker panel";
+    const title =
+      (this._config && this._config.title) || (layout && layout.name) || "Breaker panel";
 
-    root.innerHTML = `
+    this.shadowRoot.innerHTML = `
       <style>${STYLE}</style>
       <ha-card>
         <div class="header">${esc(title)}</div>
@@ -89,58 +104,70 @@ class LevitonPanelCard extends HTMLElement {
   _panelHtml(layout) {
     const rows = layout.size / 2;
     const occupied = new Set();
-    const tiles = [];
+    const cells = [];
 
     for (const b of layout.breakers) {
-      const col = b.position % 2 === 1 ? 1 : 3;
+      const left = b.position % 2 === 1;
       const row = Math.ceil(b.position / 2);
       const span = Math.max(1, b.poles);
       for (let i = 0; i < span; i++) occupied.add(b.position + 2 * i);
-      tiles.push(this._breakerHtml(b, row, col, span));
+      cells.push(this._breakerHtml(b, row, span, left));
     }
 
-    // Row-number spine and empty slots
-    const spine = [];
-    const empties = [];
     for (let r = 1; r <= rows; r++) {
-      const left = 2 * r - 1;
-      const right = 2 * r;
-      spine.push(
-        `<div class="spine" style="grid-row:${r};grid-column:2">
-           <span>${left}</span><span>${right}</span>
-         </div>`
+      const l = 2 * r - 1;
+      const rt = 2 * r;
+      cells.push(
+        `<div class="spine" style="grid-row:${r};grid-column:3"><span>${l}</span><span>${rt}</span></div>`
       );
-      if (!occupied.has(left))
-        empties.push(`<div class="slot empty" style="grid-row:${r};grid-column:1"></div>`);
-      if (!occupied.has(right))
-        empties.push(`<div class="slot empty" style="grid-row:${r};grid-column:3"></div>`);
+      if (!occupied.has(l))
+        cells.push(`<div class="empty" style="grid-row:${r};grid-column:2"></div>`);
+      if (!occupied.has(rt))
+        cells.push(`<div class="empty" style="grid-row:${r};grid-column:4"></div>`);
     }
 
     return `
       <div class="enclosure">
-        <div class="bus" aria-hidden="true"></div>
         <div class="grid" style="grid-template-rows:repeat(${rows}, var(--row-h))">
-          ${empties.join("")}${tiles.join("")}${spine.join("")}
+          ${cells.join("")}
         </div>
       </div>`;
   }
 
-  _breakerHtml(b, row, col, span) {
-    const side = col === 1 ? "left" : "right";
-    const label = b.name ? esc(b.name) : `<span class="unnamed">Position ${b.position}</span>`;
-    const rating = b.rating ? `${b.rating}A` : "";
-    const cls = ["slot", "breaker", side, b.smart ? "smart" : "basic", span > 1 ? "double" : ""]
-      .filter(Boolean)
-      .join(" ");
-    return `
-      <div class="${cls}" style="grid-row:${row} / span ${span};grid-column:${col}"
-           title="Position ${b.position}${span > 1 ? "–" + (b.position + 2 * (span - 1)) : ""}">
-        <div class="handle"><i></i></div>
-        <div class="text">
-          <div class="name">${label}</div>
-          <div class="rating">${rating}</div>
+  _breakerHtml(b, row, span, left) {
+    const side = left ? "left" : "right";
+    const faceCol = left ? 2 : 4;
+    const labelCol = left ? 1 : 5;
+    const end = b.position + 2 * (span - 1);
+    const tip = `Position ${b.position}${span > 1 ? "–" + end : ""}`;
+    const name = b.name
+      ? `<span class="nm">${esc(b.name)}</span>`
+      : `<span class="nm unnamed">Position ${b.position}</span>`;
+
+    // Fixed slots, nearest the switch first: AF, GF, OFF. A breaker without a given
+    // light keeps its (hidden) slot so the lights line up down the whole panel.
+    const present = b.indicators || [];
+    const lit = b.lit || [];
+    const leds = ["af", "gf", "off"]
+      .map((k) => {
+        const cls = [k, present.includes(k) ? "" : "absent", lit.includes(k) ? "on" : ""]
+          .filter(Boolean)
+          .join(" ");
+        return `<div class="lt${present.includes(k) ? "" : " absent"}"><i class="led ${cls}"></i><b>${k.toUpperCase()}</b></div>`;
+      })
+      .join("");
+
+    const face = `
+      <div class="face ${side}${span > 1 ? " double" : ""}" style="grid-row:${row} / span ${span};grid-column:${faceCol}" title="${esc(tip)}">
+        <div class="fc">
+          <div class="sw"><span class="t">OFF</span><span class="win ${esc(b.window || "off")}"></span><span class="t">ON</span></div>
+          <div class="amp">${b.rating ? esc(b.rating) : ""}</div>
+          <div class="ind">${leds}</div>
         </div>
       </div>`;
+
+    const label = `<div class="label ${side}" style="grid-row:${row} / span ${span};grid-column:${labelCol}" title="${esc(tip)}">${name}</div>`;
+    return face + label;
   }
 }
 
@@ -152,57 +179,77 @@ function esc(s) {
 
 const STYLE = `
   :host {
-    --row-h: 44px;
-    --gap: 4px;
+    --row-h: 56px;
+    --face-w: 176px;
     --metal: var(--secondary-background-color, #e4e6e8);
     --metal-edge: var(--divider-color, #b8bcc0);
-    --breaker: var(--card-background-color, #fff);
     --ink: var(--primary-text-color, #1c1c1c);
     --ink-dim: var(--secondary-text-color, #6b6f73);
-    --accent: var(--primary-color, #03a9f4);
   }
   .header { padding: 16px 16px 4px; font-size: 1.1rem; font-weight: 500; color: var(--ink); }
   .note { padding: 16px; color: var(--ink-dim); }
   .enclosure {
-    position: relative;
-    margin: 12px 16px 16px;
-    padding: 12px 14px;
-    background: var(--metal);
-    border: 2px solid var(--metal-edge);
-    border-radius: 6px;
-    box-shadow: inset 0 2px 6px rgba(0,0,0,.18);
+    margin: 12px 16px 16px; padding: 12px;
+    background: var(--metal); border: 2px solid var(--metal-edge); border-radius: 6px;
   }
-  .bus { position: absolute; top: 8px; bottom: 8px; left: 50%; width: 22px;
-         transform: translateX(-50%); border-radius: 3px;
-         background: repeating-linear-gradient(to bottom, transparent 0 calc(var(--row-h) - 2px), var(--metal-edge) calc(var(--row-h) - 2px) calc(var(--row-h) + var(--gap) - 2px));
-         opacity: .0; }
-  .grid { display: grid; grid-template-columns: 1fr 28px 1fr; gap: var(--gap) 0; column-gap: 0; row-gap: var(--gap); }
-  .spine { display: flex; flex-direction: column; justify-content: center; align-items: center;
-           font-size: .62rem; line-height: 1.1; color: var(--ink-dim); font-variant-numeric: tabular-nums; }
-  .slot { min-width: 0; border-radius: 3px; }
-  .slot.empty { border: 1px dashed var(--metal-edge); opacity: .6; }
-  .breaker {
-    display: flex; align-items: center; gap: 8px; padding: 0 8px;
-    background: var(--breaker); border: 1px solid var(--metal-edge);
-    box-shadow: 0 1px 0 rgba(0,0,0,.12);
+  .grid {
+    display: grid; row-gap: 4px;
+    grid-template-columns: minmax(0, 1fr) var(--face-w) 26px var(--face-w) minmax(0, 1fr);
+  }
+  .spine {
+    display: flex; flex-direction: column; justify-content: center; align-items: center;
+    font-size: .62rem; line-height: 1.1; color: var(--ink-dim); font-variant-numeric: tabular-nums;
+  }
+  .empty { border: 1px dashed var(--metal-edge); border-radius: 3px; opacity: .6; }
+
+  .label { display: flex; align-items: center; min-width: 0; padding: 0 8px; }
+  .label.left { justify-content: flex-end; text-align: right; }
+  .label.right { justify-content: flex-start; text-align: left; }
+  .nm { color: var(--ink); font-size: .85rem; font-weight: 500;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .nm.unnamed { color: var(--ink-dim); font-weight: 400; }
+
+  /* Breaker face: physical white plastic, so fixed colors regardless of theme. */
+  .face {
+    display: flex; flex-direction: column; justify-content: center;
+    background: #f4f4f1; border: 1px solid #b9b9b3; border-radius: 3px; color: #3a3a37;
     overflow: hidden;
   }
-  .breaker.left { flex-direction: row; margin-right: 4px; }
-  .breaker.right { flex-direction: row-reverse; text-align: right; margin-left: 4px; }
-  .breaker.basic { opacity: .75; }
-  .handle {
-    flex: none; width: 14px; align-self: stretch; margin: 6px 0;
-    border-radius: 2px; background: var(--metal); border: 1px solid var(--metal-edge);
-    display: flex; align-items: flex-start; justify-content: center; padding-top: 3px;
+  .fc { display: flex; align-items: center; gap: 10px; padding: 0 10px; height: 100%; }
+  /* Top of the face points to the middle of the panel. DOM order is top to bottom:
+     switch, rating, indicators. */
+  .face.left  .fc { flex-direction: row-reverse; }
+  .face.right .fc { flex-direction: row; }
+
+  /* 2-pole: the switch block is one pole wide and sits on the right half of the
+     face as photographed. Rotated so the top faces the panel middle, that half is
+     the lower row in the left column and the upper row in the right column. */
+  .face.double .fc { height: var(--row-h); flex: none; }
+  .face.double.left  { justify-content: flex-end; }
+  .face.double.right { justify-content: flex-start; }
+
+  .sw {
+    display: flex; align-items: center; gap: 4px; align-self: stretch; margin: 7px 0;
+    padding: 0 5px; background: #ebebe7; border: 1px solid #c4c4be; border-radius: 3px;
+    font-size: .56rem; font-weight: 600; letter-spacing: .02em;
   }
-  .breaker.double .handle { margin: 10px 0; }
-  .handle i { display: block; width: 8px; height: 40%; border-radius: 1px; background: var(--accent); }
-  .breaker.basic .handle i { background: var(--ink-dim); }
-  .text { min-width: 0; flex: 1; }
-  .name { color: var(--ink); font-size: .85rem; font-weight: 500;
-          white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .unnamed { color: var(--ink-dim); font-weight: 400; }
-  .rating { color: var(--ink-dim); font-size: .7rem; font-variant-numeric: tabular-nums; }
+  .face.left .sw { flex-direction: row-reverse; }
+  .win { flex: none; width: 5px; height: 16px; border-radius: 1px; border: 1px solid #9a9a94; background: #fff; }
+  .win.on { background: #2f9e44; border-color: #2b8a3e; }
+  .win.tripped { background: #e03131; border-color: #c92a2a; }
+  .win.off { background: #fff; }
+  .win.none { background: #b4b4ae; border-color: #9a9a94; }
+
+  .amp { flex: 1; text-align: center; font-size: 1rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+  /* Indicators run horizontally: AF nearest the switch, OFF farthest. DOM order is
+     AF, GF, OFF, and the face direction mirrors it for the left column. */
+  .ind { flex: none; display: flex; flex-direction: row; gap: 3px; }
+  .face.left .ind { flex-direction: row-reverse; }
+  .lt { width: 20px; display: flex; flex-direction: column; align-items: center; gap: 3px;
+        font-size: .56rem; font-weight: 700; line-height: 1; }
+  .lt.absent { visibility: hidden; }
+  .led { display: block; width: 8px; height: 8px; border-radius: 1px; background: #2b2b29; }
+  .led.on { background: #f08c00; } /* every lit indicator is amber */
 `;
 
 customElements.define("leviton-panel-card", LevitonPanelCard);
@@ -210,5 +257,5 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: "leviton-panel-card",
   name: "Leviton breaker panel",
-  description: "Physical-style layout of a Leviton panel with breaker positions and labels.",
+  description: "Physical-style layout of a Leviton panel with breaker faces, positions and labels.",
 });
