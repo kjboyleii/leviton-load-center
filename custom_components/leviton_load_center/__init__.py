@@ -9,12 +9,18 @@ from aioleviton import (
     LevitonTwoFactorRequired,
 )
 
+from homeassistant.components import websocket_api
+from homeassistant.components.frontend import add_extra_js_url
+from homeassistant.components.http import StaticPathConfig
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
-from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import device_registry as dr, config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceEntry
+from homeassistant.helpers.typing import ConfigType
+
+from pathlib import Path
 
 from .const import CONF_TOKEN, CONF_USER_ID, DOMAIN, LOGGER
 from .coordinator import (
@@ -25,6 +31,10 @@ from .coordinator import (
 )
 from .entity import should_include_breaker
 
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+CARD_URL = f"/{DOMAIN}/leviton-panel-card.js"
+
 PLATFORMS = [
     Platform.BINARY_SENSOR,
     Platform.BUTTON,
@@ -33,7 +43,23 @@ PLATFORMS = [
 ]
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: LevitonConfigEntry) -> bool:
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register the websocket command and the panel card resource."""
+    websocket_api.async_register_command(hass, ws_panel_layout)
+    await hass.http.async_register_static_paths(
+        [
+            StaticPathConfig(
+                CARD_URL,
+                str(Path(__file__).parent / "www" / "leviton-panel-card.js"),
+                False,
+            )
+        ]
+    )
+    add_extra_js_url(hass, CARD_URL)
+    return True
+    
+    
+    async def async_setup_entry(hass: HomeAssistant, entry: LevitonConfigEntry) -> bool:
     """Set up Leviton from a config entry."""
     session = async_get_clientsession(hass)
     client = LevitonClient(session)
