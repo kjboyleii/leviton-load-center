@@ -2,8 +2,15 @@
  * Leviton breaker panel card.
  *
  * Layout model (matches sensor_descriptions._is_on_leg):
- *   - Positions are numbered by row: row r holds positions 2r-1 (left) and 2r (right).
- *   - A 2-pole breaker at position p spans positions p and p+2 (two rows, same column).
+ *   - Row r holds positions 2r-1 (left column) and 2r (right column).
+ *   - A 2-pole breaker at position p spans positions p and p+2 (two rows).
+ *
+ * Breaker face model (from the Gen 2 breaker photos):
+ *   - The top of the face points toward the middle of the panel, so the push
+ *     switch sits on the inner edge and the indicator lights on the outer edge.
+ *   - Status window: green = on, red = tripped, white = physically off.
+ *   - Indicators AF / GF / OFF are only present when the breaker has them
+ *     (decided by the backend and sent in `indicators`; lit ones in `lit`).
  *
  * Card config:
  *   type: custom:leviton-panel-card
