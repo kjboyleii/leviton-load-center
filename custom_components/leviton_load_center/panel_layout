@@ -260,4 +260,3 @@ def ws_subscribe_panel_layout(
     connection.subscriptions[msg["id"]] = _unsubscribe
     connection.send_result(msg["id"])
     _push()
-
